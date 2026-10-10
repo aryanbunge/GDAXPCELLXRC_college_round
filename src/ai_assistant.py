@@ -20,7 +20,10 @@ GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "").strip()
 PROVIDER = os.environ.get(
     "NEO_AI_PROVIDER", "gemini" if GEMINI_API_KEY else "ollama").strip().lower()
 BASE_URL = os.environ.get("NEO_AI_BASE_URL", "http://127.0.0.1:11434").rstrip("/")
-DEFAULT_MODEL = "gemini-3.1-flash-lite" if PROVIDER == "gemini" else "qwen3.5:0.8b"
+# Accept either the Ollama server root or its /api base URL.
+if PROVIDER == "ollama" and BASE_URL.endswith("/api"):
+    BASE_URL = BASE_URL[:-4]
+DEFAULT_MODEL = "gemini-3.1-flash-lite" if PROVIDER == "gemini" else "qwen3.5:4b"
 MODEL = os.environ.get("NEO_AI_MODEL", DEFAULT_MODEL)
 TIMEOUT_SECONDS = 45 if PROVIDER == "gemini" else 180
 
@@ -198,7 +201,11 @@ def _chat_request(messages):
     except urllib.error.HTTPError as exc:
         try:
             error_payload = json.loads(exc.read().decode("utf-8"))
-            detail = str(error_payload.get("error", {}).get("message", ""))[:500]
+            provider_error = error_payload.get("error", "")
+            if isinstance(provider_error, dict):
+                detail = str(provider_error.get("message", ""))[:500]
+            else:
+                detail = str(provider_error)[:500]
         except (ValueError, AttributeError, TypeError):
             detail = ""
         if PROVIDER == "gemini" and exc.code == 401:
@@ -207,6 +214,13 @@ def _chat_request(messages):
             raise NeoAIError(
                 "Gemini's free-tier rate limit was reached. Wait for its quota to reset, "
                 "or check your AI Studio usage limits.") from exc
+        if PROVIDER == "ollama" and exc.code == 404:
+            if "model" in detail.lower() and "not found" in detail.lower():
+                raise NeoAIError(
+                    "Ollama does not have model " + MODEL + ". In PowerShell, run: ollama pull " + MODEL) from exc
+            raise NeoAIError(
+                "Ollama returned HTTP 404 at " + url + ". Check that Ollama is running and "
+                "NEO_AI_BASE_URL is the server root (for example, http://127.0.0.1:11434).") from exc
         message = PROVIDER + " API returned HTTP " + str(exc.code) + "."
         if detail:
             message += " " + detail

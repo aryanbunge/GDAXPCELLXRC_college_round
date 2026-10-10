@@ -57,11 +57,11 @@ Google products, so avoid dictating passwords or sensitive information.
 
 ## Use local Ollama instead
 
-Without `GEMINI_API_KEY`, Neo defaults to Ollama and `qwen3.5:0.8b`. Install
+Without `GEMINI_API_KEY`, Neo defaults to Ollama and `qwen3.5:4b`. Install
 [Ollama for Windows](https://ollama.com/download/windows), then run:
 
 ```powershell
-ollama pull qwen3.5:0.8b
+ollama pull qwen3.5:4b
 ```
 
 Leave Ollama running before starting Neo. Local AI avoids hosted token quotas,
@@ -72,8 +72,9 @@ when a key is set:
 $env:NEO_AI_PROVIDER = "ollama"
 ```
 
-For stronger local responses (at some speed cost), run `ollama pull
-qwen3.5:2b` and set `$env:NEO_AI_MODEL = "qwen3.5:2b"` before launching Neo.
+For faster responses with a smaller model, run `ollama pull qwen3.5:0.8b` and
+set `$env:NEO_AI_MODEL = "qwen3.5:0.8b"` before launching Neo. For a larger
+model, run `ollama pull qwen3.5:9b` and set `$env:NEO_AI_MODEL = "qwen3.5:9b"`.
 
 ## Current AI actions and limits
 
@@ -99,37 +100,40 @@ Notepad”, “open website example.com”, “go back”, “scroll down”, �
 “next control”, “select”, “volume up”, “set brightness to 40 percent”, “show
 desktop”, or “recalibrate cursor”. “Next control” uses the website's keyboard
 tab order; say “select” only after checking the focused control. “Neo, click”
-activates the target under the hand cursor.
+activates the target under the current hand or head pointer.
 
-For voice typing, focus the field you want first, say “start dictation”, then
-speak the text. Dictation stays on for several phrases; say “stop dictation” or
-“cancel” to leave it. To use Notepad, say “type in Notepad”, wait for Neo's
-ready message, and then speak the text. Neo types into the already focused
-Notepad window instead of reopening it.
+For voice typing, focus the field and say “Neo, start dictation”. While Neo's
+command window is active, speak the text normally; say “stop dictation” to
+finish. If the command window times out, say “Neo” again before dictating more.
+For Notepad, “Neo, type in Notepad [words]” types one phrase. Neo types into the
+focused field instead of reopening it.
 
-## Hand control and calibration
+## Hand and head control
 
-Start or stop hand control from the dashboard or say “start hand control” / “stop
-hand control”. The webcam preview displays the detected pose and its action.
-Current mappings are:
+Start or stop hand control from the dashboard or say **“start hand control”** /
+**“stop hand control”**. Existing V-sign cursor movement, deliberate click
+gestures, fist dragging, left-hand scrolling, and right-hand volume/brightness
+pinches are unchanged.
 
-- Show a **V sign** to move the cursor. Keep the V sign visible to arm the
-  deliberate hand click gestures.
-- Change from V sign to **middle finger** for left click, **index finger** for
-  right click, or bring index and middle fingers together for double click.
-- Make a **fist** to hold left mouse down while moving; open your hand to
-  release. Show an **open palm** to return to the neutral/no-action pose.
-- With the **left hand**, pinch thumb and index; move primarily up/down to
-  scroll vertically or sideways to scroll horizontally.
-- With the **right hand**, pinch thumb and index; move primarily sideways to
-  adjust brightness or up/down to adjust volume.
+For face-based head control, say **“start head tracking”** or press **Start head
+control** in Neo. Allow camera access, check that your face and lighting are
+detected, then follow the on-screen calibration dots. Calibration uses your
+comfortable head range and takes under 30 seconds. After setup, head movement
+controls the native desktop pointer. Hold still to dwell-click (900 ms by
+default), or use Neo voice commands such as **“click”**, **“right click”**,
+**“double click”**, **“scroll down”**, **“go back”**, and **“start dragging”** /
+**“drop”**. The tracker adapts exposure to lighting; use **Recalibrate** after
+changing posture. The settings page lets you adjust sensitivity and dwell time.
+The first head-tracking run needs an Internet connection to fetch the face model;
+tracking itself runs locally in Neo’s window.
 
-If posture changes, say “recalibrate cursor” or press **Recalibrate**. Neo
-rebases movement tracking on the next camera frame while leaving the cursor in
-place; the one-step reset takes less than 30 seconds. This is a quick tracking
-reset, not a four-corner screen calibration.
-The camera turns off when hand control stops. The current project supports the
-existing hand-tracking path; head-pose cursor control is not implemented.
+Both trackers use the same webcam and cannot run simultaneously. Starting head
+control stops the Python hand tracker first; starting hand control stops the
+face tracker and releases its camera stream first. Use **“stop head tracking”**
+to turn head control off, then **“start hand control”** to return to the
+original hand gestures. Neo’s desktop voice service remains the sole microphone
+listener in either mode. Camera frames are processed by the local tracker and
+are not sent to the assistant backend.
 
 ## Browser compatibility
 
@@ -144,18 +148,24 @@ every site. Use **next control** and **select**, or point and say **click**.
 See [EVALUATION.md](EVALUATION.md) for the reproducible task-time, command
 accuracy, selection error, and accidental-activation protocol.
 
-For combined pointing and voice activation, point the existing gesture cursor
-at a target and say a clear command such as “Neo, click.” Neo cannot inspect the
+For combined pointing and voice activation, point with your hand or head at a
+target and say a clear command such as “Neo, click.” Neo cannot inspect the
 contents or controls of every website or app. The existing speech recognizer
-still uses Google's speech recognition service for voice-to-text; Gemini gets
-the resulting transcript, not the microphone audio, from this integration.
+sends captured speech to Google's speech recognition service for voice-to-text;
+Gemini receives the resulting transcript, not microphone audio. This also
+applies while Neo waits to recognize its wake word. Neo no longer displays
+standby transcripts in the chat and does not explicitly save microphone clips
+to disk. Keeping standby audio local would require a local wake-word listener.
 
-After saying “Neo,” Neo now stays in an active voice-command session for up to
-60 seconds after each command, so short follow-up exchanges do not need the wake
-word repeated. For dictation, say “type in Notepad,” wait for “Notepad dictation
-is ready,” then say the words to type. Say “cancel” to stop. You can also say
-“type in Notepad [words]” in one utterance. To start another Notepad tab, say
-“add another tab on Notepad.”
+Saying “Neo” opens a 12-second command window. Give several commands during it
+without repeating the wake word; each command refreshes the 12-second timer.
+After 12 seconds without a command, Neo returns to wake-word standby. Say
+“sleep” to close the command window immediately. If you say “Neo” by itself,
+Neo waits up to ten seconds for your first command. To dictate several phrases,
+say “Neo, start dictation”, then speak while the command window remains active;
+say “stop dictation” before the window closes. You can also say “Neo, type in
+Notepad [words]” as one command. To start another Notepad tab, say “Neo, add
+another tab on Notepad.”
 
 ## Troubleshooting
 

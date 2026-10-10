@@ -17,7 +17,6 @@ import wave
 from os import listdir
 from os.path import isfile, join
 import smtplib
-import wikipedia
 import Gesture_Controller
 #import Gesture_Controller_Gloved as Gesture_Controller
 import app
@@ -44,7 +43,8 @@ files =[]
 path = ''
 neo_ai = NeoAssistant()
 dictation_target = None
-ACTIVE_LISTEN_SECONDS = 60
+ACTIVE_LISTEN_SECONDS = 12
+WAKE_COMMAND_WAIT_SECONDS = 10
 microphone_available = True
 is_awake = True  #Bot status
 WAKE_WORD = 'neo'
@@ -89,6 +89,57 @@ def yield_focus_to_desktop():
     except Exception:
         pass
 
+def canonicalize_tracking_command(text):
+    """Map common natural phrasings to the existing tracking commands."""
+    phrase = re.sub(r'\s+', ' ', (text or '').lower().replace('\u2019', "'")).strip(' ,.!?')
+    if not phrase or re.match(r'^(?:how|why|what|when|where|who)\b', phrase):
+        return None
+
+    # Do not turn a request to keep tracking on/off into the opposite action.
+    if re.search(r"\b(?:don't|dont|do not|never)\s+(?:ever\s+)?(?:stop|disable|deactivate|turn off|switch off|pause)\b", phrase):
+        return None
+    if re.search(r"\b(?:don't|dont|do not|never)\s+(?:ever\s+)?(?:start|enable|activate|turn on|switch on)\b", phrase):
+        return None
+    if re.search(r"\b(?:don't|dont|do not|never)\b.{0,24}\b(?:switch|change|move)\b", phrase):
+        return None
+
+    # A destination in a switch request disambiguates phrases mentioning both.
+    destination = re.search(
+        r'\b(?:switch|change|move)\s+(?:back\s+)?'
+        r'(?:from\s+(?:head|hand)(?:\s+(?:tracking|control|mode))?\s+)?'
+        r'to\s+(?:using\s+)?(head|hand|gesture)\b', phrase)
+    has_head = bool(re.search(r'\bhead\b', phrase))
+    has_hand = bool(re.search(r'\b(?:hand|hands|gesture|gestures|camera|webcam)\b', phrase))
+    if destination:
+        target = 'head' if destination.group(1) == 'head' else 'hand'
+        wants_on = True
+        wants_off = False
+    else:
+        if has_head == has_hand:
+            return None
+        target = 'head' if has_head else 'hand'
+        wants_off = bool(re.search(
+            r'\b(?:stop|disable|deactivate|pause|end|quit|turn off|switch off|shut off)\b', phrase))
+        wants_on = bool(re.search(
+            r'\b(?:start|enable|activate|launch|begin|resume|use|turn on|switch on)\b', phrase))
+        if re.search(r"\b(?:don't|dont|do not|no longer)\s+use\b", phrase):
+            wants_on = False
+
+        # Also understand the natural word order: “turn hand tracking off/on”.
+        if re.search(r'\b(?:turn|switch|set|keep|leave)\b.{0,28}\boff\b', phrase):
+            wants_off = True
+        if re.search(r'\b(?:turn|switch|set|keep|leave)\b.{0,28}\bon\b', phrase):
+            wants_on = True
+        if re.search(r"\b(?:don't|dont|do not|no longer)\s+(?:want|need|use)\b", phrase):
+            wants_off = True
+
+        if wants_off == wants_on:
+            return None
+
+    if target == 'head':
+        return 'start head tracking' if wants_on else 'stop head tracking'
+    return 'start hand control' if wants_on else 'stop hand control'
+
 def run_quick_action(text):
     """Run common, clearly phrased commands locally without an AI round trip."""
     phrase = (text or '').strip()
@@ -98,7 +149,10 @@ def run_quick_action(text):
     if lower in ('launch gesture recognition', 'start gesture recognition',
                  'start hand control', 'launch hand control', 'enable hand control', 'start camera', 'turn on hand control',
                  'stop gesture recognition', 'stop hand control',
-                 'disable hand control', 'stop camera', 'turn off hand control'):
+                 'disable hand control', 'stop camera', 'turn off hand control',
+                 'start head tracking', 'enable head tracking', 'use head tracking',
+                 'switch to head tracking', 'stop head tracking', 'disable head tracking',
+                 'use hand tracking', 'switch to hand tracking', 'return to hand tracking'):
         return None
 
     desktop_actions = (
@@ -107,7 +161,11 @@ def run_quick_action(text):
         'go to top', 'scroll to top', 'bottom of page', 'go to bottom',
         'scroll to bottom', 'click', 'click here',
         'click link', 'click the link', 'left click', 'confirm click',
+        'double click', 'double-click',
         'select this', 'activate this', 'right click', 'open context menu',
+        'start drag', 'start dragging', 'begin drag', 'begin dragging',
+        'hold left mouse', 'release drag', 'stop dragging', 'drop',
+        'release mouse', 'release left mouse', 'cancel drag',
         'next link', 'next control', 'next item', 'move to next control',
         'previous link', 'previous control', 'previous item', 'select',
         'select control', 'activate selected', 'press enter', 'escape',
@@ -119,12 +177,12 @@ def run_quick_action(text):
         'minimize window', 'minimize this window', 'maximize window',
         'maximize this window', 'show desktop', 'hide all windows',
     )
-    if lower in desktop_actions or re.match(r'^(?:scroll|page)\s+(?:up|down)', lower):
+    if lower in desktop_actions or re.match(r'^(?:scroll|page)\s+(?:up|down|left|right)', lower):
         yield_focus_to_desktop()
 
     sites = {
         'google': 'https://www.google.com', 'youtube': 'https://www.youtube.com',
-        'gmail': 'https://mail.google.com', 'wikipedia': 'https://www.wikipedia.org',
+        'gmail': 'https://mail.google.com',
         'reddit': 'https://www.reddit.com', 'amazon': 'https://www.amazon.com',
         'github': 'https://github.com', 'maps': 'https://maps.google.com',
     }
@@ -141,7 +199,7 @@ def run_quick_action(text):
         target = domain.group(1).replace(' dot ', '.')
         webbrowser.open(_validated_url(target))
         return 'Opening ' + target + '.'
-    website_name = re.match(r'^(?:open|visit|go to)\s+(google|youtube|gmail|wikipedia|reddit|amazon|github|maps)$', lower)
+    website_name = re.match(r'^(?:open|visit|go to)\s+(google|youtube|gmail|reddit|amazon|github|maps)$', lower)
     if website_name:
         name = website_name.group(1)
         webbrowser.open(sites[name])
@@ -169,6 +227,20 @@ def run_quick_action(text):
         steps = min(8, max(1, int(match.group(2) or 3)))
         pyautogui.scroll(steps if match.group(1) == 'up' else -steps)
         return 'Scrolling ' + match.group(1) + '.'
+    horizontal_scroll = re.match(r'^scroll\s+(left|right)(?:\s+(\d+))?$', lower)
+    if horizontal_scroll:
+        direction = horizontal_scroll.group(1)
+        steps = min(8, max(1, int(horizontal_scroll.group(2) or 3)))
+        pyautogui.keyDown('shift')
+        try:
+            # Match the existing left-hand pinch mapping: right is negative wheel.
+            pyautogui.scroll(-steps if direction == 'right' else steps)
+        finally:
+            pyautogui.keyUp('shift')
+        return 'Scrolling ' + direction + '.'
+    if lower in ('double click', 'double-click'):
+        pyautogui.doubleClick()
+        return 'Double-clicked the item under the pointer.'
     if lower in ('click', 'click here', 'click link', 'click the link',
                  'left click', 'confirm click', 'select this', 'activate this'):
         pyautogui.click()
@@ -176,6 +248,15 @@ def run_quick_action(text):
     if lower in ('right click', 'open context menu'):
         pyautogui.click(button='right')
         return 'Opened the context menu.'
+    if lower in ('start drag', 'start dragging', 'begin drag', 'begin dragging',
+                 'hold left mouse'):
+        started = Gesture_Controller.Controller.start_voice_drag()
+        return ('Drag started. Move the pointer, then say “drop” or “release drag”.'
+                if started else 'Drag is already active. Move the pointer, then say “drop”.')
+    if lower in ('release drag', 'stop dragging', 'drop', 'release mouse',
+                 'release left mouse', 'cancel drag'):
+        released = Gesture_Controller.Controller.stop_voice_drag()
+        return 'Drag released.' if released else 'No voice drag is active.'
     if lower in ('escape', 'press escape', 'cancel dialog'):
         pyautogui.press('esc')
         return 'Cancelled the current dialog.'
@@ -274,9 +355,9 @@ def run_quick_action(text):
         return 'Brightness decreased.'
     if lower in ('recalibrate', 'recalibrate cursor', 'reset cursor tracking', 'recenter cursor'):
         if not Gesture_Controller.GestureController.gc_mode:
-            return 'Start hand control first, then recalibrate while your hand is visible.'
+            return 'Start hand or head control first, then recalibrate in a comfortable neutral position.'
         Gesture_Controller.Controller.request_calibration()
-        return 'Recalibrating tracking. Keep a comfortable hand pose in view for a moment.'
+        return 'Recalibrating pointer tracking. Hold a comfortable neutral head or hand position briefly.'
 
     open_app = re.match(r'^(?:open|launch|start)\s+(?:the\s+)?(?:app\s+)?(.+)$', phrase, re.IGNORECASE)
     if open_app:
@@ -317,7 +398,36 @@ def gesture_controller_worker(controller):
     else:
         set_status('Hand tracking is off', 'listening')
     finally:
+        Gesture_Controller.Controller.set_head_tracking(False)
         set_device_state(microphone_available, False, False)
+
+
+def stop_browser_head_tracker(timeout=4.0):
+    """Stop the Eel/MediaPipe camera before Python hand tracking opens the webcam."""
+    try:
+        app.eel.stopHeadTracking()
+    except Exception as exc:
+        print('Could not ask the Neo window to stop head tracking:', exc)
+        if not app.ChatBot.browser_tracker_active:
+            Gesture_Controller.Controller.set_head_tracking(False)
+            return True
+    deadline = time.monotonic() + timeout
+    while app.ChatBot.browser_tracker_active and time.monotonic() < deadline:
+        time.sleep(0.05)
+    Gesture_Controller.Controller.set_head_tracking(False)
+    return not app.ChatBot.browser_tracker_active
+
+
+def stop_python_hand_tracker(timeout=4.0):
+    """Release OpenCV's webcam before the browser FaceLandmarker requests it."""
+    if Gesture_Controller.GestureController.gc_mode:
+        Gesture_Controller.GestureController.gc_mode = 0
+    deadline = time.monotonic() + timeout
+    while (Gesture_Controller.GestureController.gc_mode or
+           Gesture_Controller.GestureController.cap is not None) and time.monotonic() < deadline:
+        time.sleep(0.05)
+    return (not Gesture_Controller.GestureController.gc_mode and
+            Gesture_Controller.GestureController.cap is None)
 
 # ------------------Functions----------------------
 def reply(audio):
@@ -454,7 +564,7 @@ def record_audio(status='Listening for “Neo”'):
 
 # Executes Commands (input: string)
 def respond(voice_data):
-    global file_exp_status, files, is_awake, path, dictation_target, wake_armed_until
+    global file_exp_status, files, is_awake, path, dictation_target
     raw_text = (voice_data or '').strip()
     voice_data = raw_text.lower()
     print(raw_text)
@@ -475,7 +585,7 @@ def respond(voice_data):
         try:
             yield_focus_to_desktop()
             pyautogui.write(raw_text, interval=0.005)
-            reply('Added that text. Keep speaking, or say stop dictation.')
+            reply('Added that text. Say Neo before the next phrase, or say Neo then stop dictation.')
         except Exception as exc:
             dictation_target = None
             reply('I could not type that text: ' + str(exc))
@@ -484,12 +594,11 @@ def respond(voice_data):
     if voice_data in ('start dictation', 'begin dictation', 'turn on dictation', 'dictation mode', 'type into this field'):
         dictation_target = 'focused field'
         set_status('Dictation is listening — say the text to type', 'dictating')
-        reply('Dictation is ready. Say your text now, or say cancel.')
+        reply('Dictation is ready. Say Neo, then the text to type. Say Neo then stop dictation when finished.')
         return
 
     if voice_data in ('sleep', 'go to sleep', 'stop listening', 'pause voice control'):
         is_awake = False
-        wake_armed_until = 0.0
         reply('Voice controls paused. Say “Neo” when you want me again.')
         return
     if voice_data in ('wake up', 'resume listening', 'resume voice control'):
@@ -511,7 +620,7 @@ def respond(voice_data):
             else:
                 dictation_target = 'Notepad'
                 set_status('Dictation is listening — Notepad', 'dictating')
-                reply('Notepad dictation is ready. Say the text now, or say cancel.')
+                reply('Notepad is ready. Say Neo, then the text to type. Say Neo then stop dictation when finished.')
         except NeoAIError as exc:
             dictation_target = None
             reply(str(exc))
@@ -531,6 +640,10 @@ def respond(voice_data):
         ('open' in voice_data and bool(re.search(r'\b\d+\b', voice_data))))
     if file_exp_status and not file_navigation_command:
         file_exp_status = False
+    tracking_command = canonicalize_tracking_command(raw_text)
+    if tracking_command:
+        raw_text = tracking_command
+        voice_data = tracking_command
     if not file_navigation_command:
         try:
             quick_reply = run_quick_action(raw_text)
@@ -593,12 +706,49 @@ def respond(voice_data):
           re.search(r'\b(?:exit|terminate|quit|close)\s+neo\b', voice_data)):
         if Gesture_Controller.GestureController.gc_mode:
             Gesture_Controller.GestureController.gc_mode = 0
+        stop_browser_head_tracker(timeout=1.0)
         app.ChatBot.close()
         #sys.exit() always raises SystemExit, Handle it in main loop
         sys.exit()
         
     
     # DYNAMIC CONTROLS
+    elif voice_data in ('start head tracking', 'enable head tracking', 'use head tracking',
+                        'switch to head tracking'):
+        if Gesture_Controller.Controller.head_tracking_enabled:
+            reply('Head tracking is already active.')
+        elif app.ChatBot.browser_tracker_active:
+            try:
+                app.eel.startHeadTrackingFromBackend()
+                reply('Head tracking is already open. Follow the setup on screen, or cancel it there.')
+                set_status('Head tracking setup is open', 'processing')
+            except Exception as exc:
+                reply('Head tracking setup is already open. Finish or cancel it in Neo. ' + str(exc))
+        else:
+            try:
+                if not stop_python_hand_tracker():
+                    raise RuntimeError('Hand tracking did not release the webcam. Stop it and try again.')
+                app.eel.startHeadTrackingFromBackend()
+                reply('Head tracking setup is on Neo’s screen. Click Allow camera, then Continue and follow the calibration dots.')
+                set_status('Starting head tracking in Neo', 'processing')
+            except Exception as exc:
+                Gesture_Controller.Controller.set_head_tracking(False)
+                reply(str(exc))
+                set_status(str(exc), 'error')
+
+    elif voice_data in ('stop head tracking', 'disable head tracking', 'use hand tracking',
+                        'switch to hand tracking', 'return to hand tracking'):
+        if (Gesture_Controller.Controller.head_tracking_enabled or
+                app.ChatBot.browser_tracker_active):
+            if stop_browser_head_tracker():
+                reply('Head tracking is off. You can start hand control or use the keyboard and voice.')
+                set_status('Head tracking is off', 'listening')
+            else:
+                reply('The head tracker did not release the webcam. Close Neo and try again.')
+                set_status('Head tracker is still using the camera', 'error')
+        else:
+            reply('Head tracking is already off.')
+
     elif any(command in voice_data for command in (
             'launch gesture recognition', 'start gesture recognition',
             'start hand control', 'launch hand control', 'enable hand control',
@@ -607,6 +757,8 @@ def respond(voice_data):
             reply('Gesture recognition is already active')
         else:
             try:
+                if not stop_browser_head_tracker():
+                    raise RuntimeError('Head tracking did not release the webcam. Stop it and try again.')
                 gc = Gesture_Controller.GestureController()
                 t = Thread(target=gesture_controller_worker, args=(gc,))
                 t.daemon = True
@@ -625,8 +777,15 @@ def respond(voice_data):
             'turn off hand control')):
         if Gesture_Controller.GestureController.gc_mode:
             Gesture_Controller.GestureController.gc_mode = 0
+            Gesture_Controller.Controller.set_head_tracking(False)
             set_device_state(microphone_available, False, False)
             reply('Gesture recognition stopped')
+        elif (Gesture_Controller.Controller.head_tracking_enabled or
+              app.ChatBot.browser_tracker_active):
+            if stop_browser_head_tracker():
+                reply('Head tracking stopped.')
+            else:
+                reply('The head tracker did not release the webcam. Close Neo and try again.')
         else:
             reply('Gesture recognition is already inactive')
         
@@ -716,54 +875,96 @@ if not app.ChatBot.started:
 set_device_state(microphone_available, False, False)
 wish()
 voice_data = None
-wake_armed_until = 0.0
+awaiting_command = False
+command_deadline = 0.0
+session_active = False
+session_deadline = 0.0
 while True:
+    command_from_voice = False
     if app.ChatBot.isUserInput():
-        #take input from GUI
+        # Typed dashboard requests are one command and return to wake-word standby.
         voice_data = app.ChatBot.popUserInput()
-        # GUI commands also open a short hands-free follow-up window.
-        wake_armed_until = time.monotonic() + ACTIVE_LISTEN_SECONDS
+        awaiting_command = False
+        command_deadline = 0.0
         set_status('Processing your message', 'processing')
-        # Route text through the same handler and command normalization as speech.
         command_data = remove_wake_word(voice_data)
     else:
-        #take input from Voice
-        session_active = time.monotonic() < wake_armed_until
+        if awaiting_command and time.monotonic() >= command_deadline:
+            awaiting_command = False
+            command_deadline = 0.0
+            session_deadline = 0.0
+            session_active = False
+            set_status('Listening for “Neo”', 'listening')
+            continue
+
+        if session_active and not awaiting_command and time.monotonic() >= session_deadline:
+            session_active = False
+            session_deadline = 0.0
+
         if dictation_target:
-            listen_status = ('Dictation is listening — say your text' if session_active else
-                             'Dictation paused — say “Neo” to continue')
+            if awaiting_command:
+                listen_status = 'Neo heard — say a dictation phrase'
+            elif session_active:
+                listen_status = 'Dictation active — say another phrase or “sleep”'
+            else:
+                listen_status = 'Dictation paused — say “Neo” to continue'
         else:
-            listen_status = 'Neo is active — say your command' if session_active else 'Listening for “Neo”'
+            if awaiting_command:
+                listen_status = 'Neo heard — say a command'
+            elif session_active:
+                listen_status = 'Neo active — say another command or “sleep”'
+            else:
+                listen_status = 'Listening for “Neo”'
         voice_data = record_audio(listen_status)
-        # Re-check after recording because an active command window can expire while listening.
-        session_active = time.monotonic() < wake_armed_until
+
         if has_wake_word(voice_data, allow_new=not session_active):
             is_awake = True
             command_data = remove_wake_word(voice_data, allow_new=not session_active)
             if not command_data:
-                # Keep a short conversational command window after activation.
-                wake_armed_until = time.monotonic() + ACTIVE_LISTEN_SECONDS
+                # A standalone wake word opens a short command window.
+                session_active = True
+                session_deadline = 0.0
+                awaiting_command = True
+                command_deadline = time.monotonic() + WAKE_COMMAND_WAIT_SECONDS
                 app.ChatBot.addUserMsg('Neo')
-                reply("I'm listening. Go ahead.")
+                reply("I'm listening. Go ahead with your command.")
+                set_status('Neo heard — listening for a command', 'listening')
                 continue
-            else:
-                wake_armed_until = time.monotonic() + ACTIVE_LISTEN_SECONDS
-        elif time.monotonic() < wake_armed_until:
+        elif awaiting_command or session_active:
             if not voice_data:
+                if awaiting_command and time.monotonic() >= command_deadline:
+                    awaiting_command = False
+                    command_deadline = 0.0
+                    session_active = False
+                    session_deadline = 0.0
+                    set_status('Listening for “Neo”', 'listening')
+                elif awaiting_command:
+                    set_status('Neo heard — say a command', 'listening')
+                elif session_active:
+                    set_status('Neo active — say another command or “sleep”', 'listening')
                 continue
             command_data = voice_data
-            wake_armed_until = time.monotonic() + ACTIVE_LISTEN_SECONDS
         else:
-            wake_armed_until = 0.0
             if voice_data:
-                app.ChatBot.addAppMsg('I heard: "' + voice_data + '". Say "Neo" or "new" to activate.')
                 set_status('Say “Neo” or “new” to activate', 'listening')
             continue
 
+        # Consume the first-command slot; after handling, keep a short rolling
+        # session so follow-up commands do not need another wake word.
+        awaiting_command = False
+        command_deadline = 0.0
+        command_from_voice = True
+
     try:
-        # Voice requests reach the command handler only after the standalone wake word.
-        # Text entered intentionally in Neo's window is handled directly.
+        # Voice reaches commands through the wake word or an active short session.
         respond(command_data)
+        if command_from_voice and is_awake:
+            session_active = True
+            session_deadline = time.monotonic() + ACTIVE_LISTEN_SECONDS
+            set_status('Neo active — say another command or “sleep”', 'listening')
+        else:
+            session_active = False
+            session_deadline = 0.0
     except SystemExit:
         reply("Exit Successful")
         break

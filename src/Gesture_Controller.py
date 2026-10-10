@@ -265,6 +265,8 @@ class Controller:
     trial = True
     flag = False
     grabflag = False
+    voice_drag_active = False
+    left_button_down = False
     pinchmajorflag = False
     pinchminorflag = False
     pinchstartxcoord = None
@@ -278,6 +280,7 @@ class Controller:
     pinch_threshold = 0.25
     scroll_gain = 16
     max_scroll_steps = 24
+    head_tracking_enabled = False
     
     def getpinchylv(hand_result):
         """returns distance beween starting pinch y coord and current hand position y coord."""
@@ -417,10 +420,56 @@ class Controller:
         Controller.pinchaxis = None
         Controller.pinchdirectionflag = None
 
+    def sync_left_button():
+        """Hold the OS left button while a hand or voice drag is active."""
+        should_hold = Controller.grabflag or Controller.voice_drag_active
+        if should_hold == Controller.left_button_down:
+            return
+        if should_hold:
+            pyautogui.mouseDown(button="left")
+            Controller.left_button_down = True
+        else:
+            try:
+                pyautogui.mouseUp(button="left")
+            finally:
+                Controller.left_button_down = False
+
+    def start_voice_drag():
+        """Begin an explicit voice-controlled left-button drag."""
+        if Controller.voice_drag_active:
+            return False
+        Controller.voice_drag_active = True
+        try:
+            Controller.sync_left_button()
+        except Exception:
+            Controller.voice_drag_active = False
+            raise
+        return True
+
+    def stop_voice_drag():
+        """End voice drag without interrupting a fist gesture that is still held."""
+        if not Controller.voice_drag_active:
+            return False
+        Controller.voice_drag_active = False
+        Controller.sync_left_button()
+        return True
+
     def request_calibration():
         """Rebase hand movement and pinch state on the next camera frame."""
         Controller.calibration_requested = True
 
+    def set_head_tracking(enabled):
+        """Record head-control state; the Eel UI now runs the face tracker."""
+        enabled = bool(enabled)
+        if enabled != Controller.head_tracking_enabled:
+            Controller.grabflag = False
+            Controller.voice_drag_active = False
+            Controller.sync_left_button()
+        Controller.head_tracking_enabled = enabled
+        if enabled:
+            Controller.prev_hand = None
+            Controller.reset_pinch_control()
+            Controller.flag = False
     def pinch_control(hand_result, controlHorizontal, controlVertical):
         """
         Applies a control step when the pinch moves beyond the noise threshold.
@@ -465,14 +514,20 @@ class Controller:
 
     def handle_controls(gesture, hand_result):  
         """Impliments all gesture functionality."""      
+        # Head tracking owns the desktop pointer while it is active. The hand
+        # camera may still be running for its preview, but allowing this loop
+        # to move/click at the same time makes the pointer jump unpredictably.
+        if Controller.head_tracking_enabled:
+            return
+
         x,y = None,None
-        if gesture != Gest.PALM :
+        if gesture != Gest.PALM:
             x,y = Controller.get_position(hand_result)
         
         # flag reset
         if gesture != Gest.FIST and Controller.grabflag:
             Controller.grabflag = False
-            pyautogui.mouseUp(button = "left")
+            Controller.sync_left_button()
 
         if gesture != Gest.PINCH_MAJOR and Controller.pinchmajorflag:
             Controller.pinchmajorflag = False
@@ -488,7 +543,7 @@ class Controller:
         elif gesture == Gest.FIST:
             if not Controller.grabflag : 
                 Controller.grabflag = True
-                pyautogui.mouseDown(button = "left")
+                Controller.sync_left_button()
             pyautogui.moveTo(x, y, duration = 0.1)
 
         elif gesture == Gest.MID and Controller.flag:
@@ -580,7 +635,8 @@ def draw_gesture_feedback(image, gesture, hand_name="Right hand", action_overrid
     for index, line in enumerate(lines):
         cv2.putText(image, line, (padding, padding + line_height * (index + 1) - 5),
                     font, font_scale, (80, 255, 120), 1, cv2.LINE_AA)
-        
+
+
 '''
 ----------------------------------------  Main Class  ----------------------------------------
     Entry point of Gesture Controller
@@ -622,12 +678,23 @@ class GestureController:
     def __init__(self):
         """Initilaizes attributes."""
         GestureController.gc_mode = 1
-        GestureController.cap = cv2.VideoCapture(0)
+        # DirectShow usually delivers lower-latency frames on Windows. Fall
+        # back to OpenCV's default backend for cameras that do not support it.
+        GestureController.cap = cv2.VideoCapture(0, cv2.CAP_DSHOW)
+        if not GestureController.cap.isOpened():
+            GestureController.cap.release()
+            GestureController.cap = cv2.VideoCapture(0)
         if not GestureController.cap.isOpened():
             GestureController.cap.release()
             GestureController.cap = None
             GestureController.gc_mode = 0
             raise RuntimeError("Neo could not access the webcam. Check that it is connected and not in use by another app.")
+        # 640x480 is sufficient for the supported gestures and substantially
+        # cheaper than common 720p/1080p webcam defaults.
+        GestureController.cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+        GestureController.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+        GestureController.cap.set(cv2.CAP_PROP_FPS, 30)
+        GestureController.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
         GestureController.CAM_HEIGHT = GestureController.cap.get(cv2.CAP_PROP_FRAME_HEIGHT)
         GestureController.CAM_WIDTH = GestureController.cap.get(cv2.CAP_PROP_FRAME_WIDTH)
     
@@ -673,7 +740,12 @@ class GestureController:
         handmajor = HandRecog(HLabel.MAJOR)
         handminor = HandRecog(HLabel.MINOR)
 
-        with mp_hands.Hands(max_num_hands = 2,min_detection_confidence=0.5, min_tracking_confidence=0.5) as hands:
+        with mp_hands.Hands(
+                static_image_mode=False,
+                max_num_hands=2,
+                model_complexity=0,
+                min_detection_confidence=0.5,
+                min_tracking_confidence=0.5) as hands:
             while GestureController.cap.isOpened() and GestureController.gc_mode:
                 success, image = GestureController.cap.read()
 
@@ -681,17 +753,26 @@ class GestureController:
                     print("Ignoring empty camera frame.")
                     continue
 
+                frame_height, frame_width = image.shape[:2]
+                frame_scale = min(1.0, 640.0 / frame_width, 480.0 / frame_height)
+                if frame_scale < 1.0:
+                    image = cv2.resize(
+                        image,
+                        (int(frame_width * frame_scale), int(frame_height * frame_scale)),
+                        interpolation=cv2.INTER_AREA,
+                    )
+
                 if Controller.calibration_requested:
                     Controller.prev_hand = None
                     Controller.reset_pinch_control()
                     Controller.calibration_requested = False
                 
-                image = cv2.cvtColor(cv2.flip(image, 1), cv2.COLOR_BGR2RGB)
-                image.flags.writeable = False
-                results = hands.process(image)
-                
-                image.flags.writeable = True
-                image = cv2.cvtColor(image, cv2.COLOR_RGB2BGR)
+                # Keep the preview in BGR and make only the RGB inference copy;
+                # the old loop converted RGB back to BGR after every frame.
+                image = cv2.flip(image, 1)
+                inference_image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+                inference_image.flags.writeable = False
+                results = hands.process(inference_image)
 
                 display_gesture = Gest.PALM
                 display_hand_name = "Right hand"
@@ -725,7 +806,13 @@ class GestureController:
                         Controller.handle_controls(gest_name, handmajor.hand_result)
                     
                     for hand_landmarks in results.multi_hand_landmarks:
-                        mp_drawing.draw_landmarks(image, hand_landmarks, mp_hands.HAND_CONNECTIONS)
+                        mp_drawing.draw_landmarks(
+                            image, hand_landmarks, mp_hands.HAND_CONNECTIONS,
+                            landmark_drawing_spec=mp_drawing.DrawingSpec(
+                                color=(0, 220, 255), thickness=1, circle_radius=1),
+                            connection_drawing_spec=mp_drawing.DrawingSpec(
+                                color=(100, 220, 100), thickness=1),
+                        )
                 else:
                     Controller.prev_hand = None
                     Controller.reset_pinch_control()
@@ -744,6 +831,7 @@ class GestureController:
         GestureController.cap.release()
         GestureController.cap = None
         GestureController.gc_mode = 0
+        Controller.set_head_tracking(False)
         cv2.destroyAllWindows()
 
 # uncomment to run directly

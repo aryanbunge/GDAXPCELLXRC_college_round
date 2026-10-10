@@ -10,6 +10,12 @@ Note: Use Python version: 3.8.5
 # Features
  _click on dropdown to know more_ <br>
 
+- Optional face-based head-pointer mode: say “start head tracking” or use the
+  Neo dashboard, allow camera access, and follow the short calibration. Head
+  movement controls the native pointer; dwell or voice commands activate it.
+  Head and hand tracking share the webcam, so Neo releases one tracker before
+  starting the other. Existing hand gestures and voice actions remain available.
+
 ### Gesture Recognition:
 <details>
 <summary>Neutral Gesture</summary>
