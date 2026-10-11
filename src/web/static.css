@@ -1,6 +1,0 @@
-/* STATIC BUILD: no movement of any kind */
-*,*::before,*::after{animation:none!important;transition:none!important;scroll-behavior:auto!important}
-#ink,#ink2,#fxcur{display:none!important}
-#neo .gx,body .neo-hero,body .control-deck,body .conversation-panel,body .card,body .rail-card,body .input-card,body .neo-inputs,.orb,.actions button,button{transform:none!important}
-#neo .rv{opacity:1!important;translate:none!important}
-.mega em{transform:rotate(-4deg) translateY(.03em)!important}
